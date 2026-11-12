@@ -1,78 +1,95 @@
-# 示例插件：nginx 显示一个网页，向登录的人问好。改成自己的应用见 https://github.com/wontonapp/wonton-docs/blob/main/develop.md#写插件。
+# Scrutiny（硬盘健康预警）：读每块硬盘的 S.M.A.R.T. 数据，坏盘前提醒。
+# 上游 omnibus 镜像一个容器里带齐四样（s6 服务，见上游 docker/Dockerfile 和 rootfs/etc/）：
+#   InfluxDB（数据存 /opt/scrutiny/influxdb）、webapp+API（8080）、
+#   collector（启动时跑一次，之后由容器内 cron 每天跑，COLLECTOR_CRON_SCHEDULE 可改）。
+# 镜像按 GHCR 清单列表摘要固定（amd64+arm64，docker buildx imagetools inspect 核对）。
+#
+# 硬盘授权按设备 ADR（wontonapp/wonton#335）的 devices.disk：装的时候核心列出宿主
+# /dev/disk/by-id 的整盘给主人勾选，勾了的盘只读交给容器（/dev/sda…、/dev/nvme0n1…），
+# 随盘自动给 SYS_RAWIO（清单不能也不必另写 cap.SYS_RAWIO），并自动只读挂宿主 /run/udev
+# （不单列权限）。NVMe 读 SMART 是否还需要 SYS_ADMIN 待核心实测；上游 README 对 NVMe
+# 要求它，所以 cap.SYS_ADMIN 先保留——代价是现在所有安装都要按"最高"级多确认一步，
+# 核心能按勾选细分（只勾 SATA 盘的不到"最高"级）或实测说不需要时摘。
+# 核心还没实现 devices.disk 和插件规范 0.13 的设备声明，这份清单过不了 plugin check
+# （规范 0.12 的 devices 源只收 /dev/net/tun、/dev/fuse），装上也扫不到盘，未上架。
 services:
-  web:
-    # 镜像按摘要固定（多架构镜像写清单列表的摘要），标签只给人看。
-    image: nginx:1.31.8-alpine@sha256:713fc2ebfd92e8217db451477182ee91944b123d2b1ee9fd5a8c6e91ca6c3a11
+  scrutiny:
+    image: ghcr.io/analogj/scrutiny:v0.10.0-omnibus@sha256:90062edac57a2bd891d641344184f5f730f19394b1124f6fc53904a3d8cb21c2
     environment:
-      # 网关代登录：SSI 回显的 Remote-User 只信核心带来的。官方镜像启动时对 templates 目录里的
-      # *.template 做 envsubst，把下面的地址换进 nginx 配置（见 web/default.conf.template）。
-      WONTON_CORE_ADDRESS: ${WONTON_CORE_ADDRESS}
-    # 包里的文件经 configs 交给容器（核心在启动前写进去），不能用卷挂载。
-    configs:
-      - source: site
-        target: /etc/nginx/templates/default.conf.template
-      - source: page
-        target: /usr/share/nginx/html/index.html
-      - source: tokens
-        target: /usr/share/nginx/html/tokens.css
+      TZ: ${TZ}
+      # 硬盘告警经核心的内部邮箱发信（notify 权限注入下面三个变量），转进主人的 Wonton 私聊。
+      # shoutrrr v0.16.3 的 smtp 服务：不填用户名就不发 AUTH（Auth 默认 Unknown→None），
+      # 服务器不提供 STARTTLS 时警告一句继续明文发（RequireStartTLS 默认关），核心的内部
+      # SMTP 正好是这样（见插件规范"发信"）。
+      SCRUTINY_NOTIFY_URLS: "smtp://${WONTON_SMTP_HOST}:${WONTON_SMTP_PORT}/?fromaddress=${WONTON_MAIL_FROM}&toaddresses=${WONTON_OWNER_EMAIL}"
+    # SYS_RAWIO 由核心随 devices.disk 注入（清单不另写）；NVMe 盘查 S.M.A.R.T. 上游还要求
+    # SYS_ADMIN（上游 README，issue #26），是否必需待核心实测。它是"最高"级权限：
+    # 现在每次安装都多一步确认，核心按勾选细分后应只有勾了 NVMe 盘的安装才需要。
+    cap_add:
+      - SYS_ADMIN
+    volumes:
+      - ${WONTON_APP_DATA}/config:/opt/scrutiny/config
+      - ${WONTON_APP_DATA}/influxdb:/opt/scrutiny/influxdb
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/healthz"]
+      # /api/health 只在 webapp 和内置 InfluxDB 都就绪后才答 200（上游 collector-once 也用它等就绪）。
+      test: ["CMD", "curl", "--fail", "--silent", "--head", "http://127.0.0.1:8080/api/health"]
       interval: 30s
       timeout: 5s
-      start_period: 30s
-      start_interval: 1s
-
-configs:
-  site:
-    file: web/default.conf.template
-  page:
-    file: web/index.html
-  tokens:
-    file: web/tokens.css
+      start_period: 60s
+      start_interval: 2s
 
 x-wonton:
-  spec: "0.6"
-  # 换成你自己的：反向域名形式，装上以后不能改。
-  id: app.example.hello
-  version: 0.1.1
+  spec: "0.13"
+  id: app.scrutiny.scrutiny
+  version: 0.1.0
   kind: app
-  title: { zh: 你好, en: Hello }
-  description: { zh: 向登录的人问好的示例网页, en: An example page that greets whoever is signed in }
-  icon: icon.svg
+  title: { zh: 硬盘健康（Scrutiny）, en: Disk Health (Scrutiny) }
+  description:
+    zh: 像给硬盘做体检，每天检查一遍家里所有硬盘，发现要坏的先提醒你
+    en: "A daily checkup for every disk in your home server, warning you before a drive fails"
+  icon: icon.png
   notices: [NOTICE]
-  screenshots: [screenshots/home.png]
-  author: { name: Example }
-  homepage: https://nginx.org
-  # 应用（这里是 nginx）的许可证；插件包自己的许可证写在仓库的 LICENSE 里。
-  license: BSD-2-Clause
+  author: { name: geraldpeng6 }
+  homepage: https://github.com/AnalogJ/scrutiny
+  # 上游应用的许可证；插件包自己的许可证写在仓库的 LICENSE 里。
+  license: MIT
   tags:
-    zh: [工具]
-    en: [Tools]
+    zh: [监控, 工具]
+    en: [Monitoring, Tools]
   about:
     zh: |
-      一个示例网页：登录以后，页面会向你问好。新建插件时可以照着改。
+      每天自动给家里每块硬盘做一次体检：温度、通电时间、健康指标都在网页上看得到；
+      指标变差时提前提醒，让你赶在数据丢之前备份、换盘。
+
+      硬盘出问题会主动给你发消息，不用天天去看。
     en: |
-      An example page: once you are signed in, the page says hello. Copy it as a starting point for a new plugin.
-  release_notes: { zh: 名字和说明更新。, en: Product name and description update. }
+      Every disk gets an automatic daily checkup: temperature, power-on hours
+      and health metrics, all visible in one dashboard. When a drive starts to
+      degrade you get a warning, so you can back up and replace it before data
+      is lost.
+
+      The plugin messages you when something goes wrong — no need to check
+      the dashboard every day.
+  release_notes: { zh: 第一版。, en: First release. }
   webui:
-    service: web
-    port: 80
-    # 示例页回显网关注入的用户名，见 https://github.com/wontonapp/wonton-docs/blob/main/plugin-spec.md#网关代登录sso-proxy。
-    sso: proxy
-    proxy:
-      headers:
-        Remote-User: "{user}"
-  # 能放进侧边栏“我的应用”的页面，见 https://github.com/wontonapp/wonton-docs/blob/main/plugin-spec.md#应用页面tabs。放不放由用户决定。
-  tabs:
-    - id: home
-      title: { zh: 主页, en: Home }
-      icon: tabs/home.svg
-      icon_selected: tabs/home-fill.svg
-      path: /
-      # 这个页面没做适配，用默认的 inset：从状态栏下沿开始，页面不用管安全区。
-      # 想让内容从状态栏后面滚过，写 layout: edge-to-edge，并用 --wonton-inset-* 留出系统安全区的位置。
-  permissions: []
-  # 上游 nginx 官方镜像，amd64 和 arm64 都有；上游没写最低内存，按本机空闲实测取整（实测约 24M，取 64M）。
+    service: scrutiny
+    port: 8080
+    # 上游没有任何登录（本来就该只在家里打开），网关挡在前面就够了。
+    sso: none
+  permissions:
+    # 装时主人勾选整盘，核心只读交盘并随盘给 SYS_RAWIO。
+    - devices.disk
+    # NVMe 盘查 S.M.A.R.T. 上游还要求 SYS_ADMIN（上游 README，issue #26），是否必需待核心实测；
+    # 它是"最高"级，所有安装都得多确认一步，核心按勾选细分后应只有勾了 NVMe 盘的安装才需要。
+    - cap.SYS_ADMIN
+    # 硬盘告警经核心内部邮箱发给主人；owner.identity 拿主人的收件地址。
+    - notify
+    - owner.identity
+  devices:
+    disk:
+      - { service: scrutiny }
   requirements:
     arch: [amd64, arm64]
-    memory: 64M
+    # 上游没写最低内存；omnibus 一个容器跑 webapp 加内置 InfluxDB，1G 是估算，未实测，
+    # 512M 在内存紧张的主机上容易 OOM 反复重启；装起来后按 docker stats 实测再调。
+    memory: 1G
